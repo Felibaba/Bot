@@ -1,3 +1,19 @@
+/**
+ * Consolidated Telegram Bot + Admin Panel server
+ * -----------------------------------------------
+ * - Telegram bot: sends a welcome message when a user /start's the bot,
+ *   and can broadcast a message to every stored user.
+ * - MongoDB: stores users (for broadcasting) and the editable messages
+ *   (welcome + broadcast text) as simple documents.
+ * - Admin page: a single plain HTML page (no template engine) served
+ *   as a static file, protected by a password with a max-attempt lockout,
+ *   from which you can edit the welcome message, edit the broadcast
+ *   message, and trigger the broadcast.
+ *
+ * Everything lives in this one file for simplicity, aside from the
+ * static HTML/CSS/JS for the admin page in /public/admin.html.
+ */
+
 require('dotenv').config();
 
 const path = require('path');
@@ -87,16 +103,44 @@ async function upsertUser(chatId, meta = {}) {
   await usersCol.updateOne(
     { chatId },
     {
-      $set: { ...meta, lastSeen: new Date() },
+      $set: { ...meta, subscribed: true, lastSeen: new Date() },
       $setOnInsert: { chatId, firstSeen: new Date() },
     },
     { upsert: true }
   );
 }
 
-async function getAllUserChatIds() {
-  const docs = await usersCol.find({}, { projection: { chatId: 1 } }).toArray();
+async function markUnsubscribed(chatId) {
+  await usersCol.updateOne(
+    { chatId },
+    { $set: { subscribed: false, unsubscribedAt: new Date() } }
+  );
+}
+
+async function getAllSubscribedChatIds() {
+  const docs = await usersCol
+    .find({ subscribed: { $ne: false } }, { projection: { chatId: 1 } })
+    .toArray();
   return docs.map((d) => d.chatId);
+}
+
+async function getUsersList(filter = {}) {
+  return usersCol
+    .find(filter, {
+      projection: {
+        _id: 0,
+        chatId: 1,
+        username: 1,
+        firstName: 1,
+        lastName: 1,
+        subscribed: 1,
+        firstSeen: 1,
+        lastSeen: 1,
+        unsubscribedAt: 1,
+      },
+    })
+    .sort({ lastSeen: -1 })
+    .toArray();
 }
 
 // ---------------------------------------------------------------------------
@@ -124,10 +168,35 @@ bot.onText(/\/start/, async (msg) => {
   }
 });
 
+bot.onText(/\/stop/, async (msg) => {
+  const chatId = msg.chat.id;
+  try {
+    await markUnsubscribed(chatId);
+    await bot.sendMessage(
+      chatId,
+      "You've been unsubscribed. Send /start anytime to resubscribe."
+    );
+  } catch (err) {
+    console.error('Error handling /stop:', err);
+  }
+});
+
+// Telegram error codes that mean the user is no longer reachable
+// (they blocked the bot, deactivated their account, or the chat was deleted).
+function isUnreachableError(err) {
+  const code = err?.response?.body?.error_code;
+  const description = err?.response?.body?.description || '';
+  return (
+    code === 403 ||
+    /blocked by the user|user is deactivated|chat not found/i.test(description)
+  );
+}
+
 async function broadcastToAllUsers(text) {
-  const chatIds = await getAllUserChatIds();
+  const chatIds = await getAllSubscribedChatIds();
   let sent = 0;
   let failed = 0;
+  let newlyUnsubscribed = 0;
 
   for (const chatId of chatIds) {
     try {
@@ -136,12 +205,16 @@ async function broadcastToAllUsers(text) {
     } catch (err) {
       failed += 1;
       console.error(`Failed to send to ${chatId}:`, err.message);
+      if (isUnreachableError(err)) {
+        await markUnsubscribed(chatId);
+        newlyUnsubscribed += 1;
+      }
     }
     // Small delay to be gentle on Telegram's rate limits
     await new Promise((resolve) => setTimeout(resolve, 40));
   }
 
-  return { total: chatIds.length, sent, failed };
+  return { total: chatIds.length, sent, failed, newlyUnsubscribed };
 }
 
 // ---------------------------------------------------------------------------
@@ -290,11 +363,28 @@ app.post('/api/broadcast/send', requireAuth, async (req, res) => {
 
 app.get('/api/stats', requireAuth, async (req, res) => {
   try {
-    const count = await usersCol.countDocuments();
-    res.json({ userCount: count });
+    const total = await usersCol.countDocuments();
+    const subscribed = await usersCol.countDocuments({ subscribed: { $ne: false } });
+    const unsubscribed = await usersCol.countDocuments({ subscribed: false });
+    res.json({ userCount: total, subscribed, unsubscribed });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'Failed to load stats' });
+  }
+});
+
+app.get('/api/users', requireAuth, async (req, res) => {
+  try {
+    const { status } = req.query; // 'subscribed' | 'unsubscribed' | undefined (all)
+    let filter = {};
+    if (status === 'subscribed') filter = { subscribed: { $ne: false } };
+    if (status === 'unsubscribed') filter = { subscribed: false };
+
+    const users = await getUsersList(filter);
+    res.json({ users });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to load users' });
   }
 });
 
