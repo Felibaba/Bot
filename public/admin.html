@@ -91,6 +91,45 @@
   }
   .stat strong { color: var(--text); }
   .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+  .tab-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 500;
+  }
+  .tab-btn.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .users-list {
+    max-height: 260px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .user-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .user-row:last-child { border-bottom: none; }
+  .user-name { color: var(--text); }
+  .user-meta { color: var(--muted); font-size: 12px; }
+  .badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+  }
+  .badge.sub { background: rgba(79, 214, 122, 0.15); color: var(--success); }
+  .badge.unsub { background: rgba(255, 92, 92, 0.15); color: var(--danger); }
+  .empty-state { padding: 20px; text-align: center; color: var(--muted); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -116,8 +155,24 @@
     </div>
 
     <div class="section">
-      <div class="row">
-        <span class="stat">Total users: <strong id="user-count">–</strong></span>
+      <div class="row" style="gap:24px; flex-wrap: wrap;">
+        <span class="stat">Total: <strong id="user-count">–</strong></span>
+        <span class="stat">Subscribed: <strong id="subscribed-count" style="color: var(--success);">–</strong></span>
+        <span class="stat">Unsubscribed: <strong id="unsubscribed-count" style="color: var(--danger);">–</strong></span>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="row" style="margin-bottom: 14px;">
+        <div style="display:flex; gap:8px;">
+          <button class="tab-btn active" data-filter="subscribed">Subscribed</button>
+          <button class="tab-btn secondary" data-filter="unsubscribed">Unsubscribed</button>
+          <button class="tab-btn secondary" data-filter="all">All</button>
+        </div>
+        <button class="secondary" id="refresh-users-btn">Refresh</button>
+      </div>
+      <div id="users-list" class="users-list">
+        <p class="stat">Loading…</p>
       </div>
     </div>
 
@@ -166,11 +221,14 @@
     }
   }
 
+  let currentFilter = 'subscribed';
+
   async function showDashboard() {
     loginCard.style.display = 'none';
     dashboardCard.style.display = 'block';
     await loadMessages();
     await loadStats();
+    await loadUsers(currentFilter);
   }
 
   async function loadMessages() {
@@ -186,7 +244,78 @@
     if (!res.ok) return;
     const data = await res.json();
     $('user-count').textContent = data.userCount;
+    $('subscribed-count').textContent = data.subscribed;
+    $('unsubscribed-count').textContent = data.unsubscribed;
   }
+
+  function formatDate(isoString) {
+    if (!isoString) return '–';
+    const d = new Date(isoString);
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  }
+
+  function renderUsers(users) {
+    const container = $('users-list');
+    if (!users.length) {
+      container.innerHTML = '<div class="empty-state">No users found.</div>';
+      return;
+    }
+
+    container.innerHTML = users
+      .map((u) => {
+        const name = u.username
+          ? '@' + u.username
+          : [u.firstName, u.lastName].filter(Boolean).join(' ') || 'Unknown user';
+        const isSub = u.subscribed !== false;
+        const badge = isSub
+          ? '<span class="badge sub">Subscribed</span>'
+          : '<span class="badge unsub">Unsubscribed</span>';
+        const dateLabel = isSub
+          ? `Joined ${formatDate(u.firstSeen)}`
+          : `Left ${formatDate(u.unsubscribedAt)}`;
+
+        return `
+          <div class="user-row">
+            <div>
+              <div class="user-name">${name}</div>
+              <div class="user-meta">${dateLabel} · Chat ID: ${u.chatId}</div>
+            </div>
+            ${badge}
+          </div>
+        `;
+      })
+      .join('');
+  }
+
+  async function loadUsers(filter) {
+    $('users-list').innerHTML = '<p class="stat" style="padding:14px;">Loading…</p>';
+    const query = filter === 'all' ? '' : `?status=${filter}`;
+    const res = await fetch(`/api/users${query}`);
+    if (!res.ok) {
+      $('users-list').innerHTML = '<div class="empty-state">Failed to load users.</div>';
+      return;
+    }
+    const data = await res.json();
+    renderUsers(data.users || []);
+  }
+
+  document.querySelectorAll('.tab-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.tab-btn').forEach((b) => {
+        b.classList.remove('active');
+        b.classList.add('secondary');
+      });
+      btn.classList.add('active');
+      btn.classList.remove('secondary');
+      currentFilter = btn.dataset.filter;
+      loadUsers(currentFilter);
+    });
+  });
+
+  $('refresh-users-btn').addEventListener('click', () => {
+    loadStats();
+    loadUsers(currentFilter);
+  });
 
   $('login-btn').addEventListener('click', async () => {
     const password = $('password').value;
@@ -276,7 +405,13 @@
       const data = await res.json();
 
       if (res.ok && data.success) {
-        showMsg(msgEl, `Broadcast sent. Total: ${data.total}, Sent: ${data.sent}, Failed: ${data.failed}`, 'success');
+        let text = `Broadcast sent. Total: ${data.total}, Sent: ${data.sent}, Failed: ${data.failed}`;
+        if (data.newlyUnsubscribed) {
+          text += `. ${data.newlyUnsubscribed} user(s) marked unsubscribed (blocked the bot).`;
+        }
+        showMsg(msgEl, text, 'success');
+        await loadStats();
+        await loadUsers(currentFilter);
       } else {
         showMsg(msgEl, data.error || 'Broadcast failed.', 'error');
       }
